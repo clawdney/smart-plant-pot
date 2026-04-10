@@ -15,8 +15,28 @@ import time
 app = Flask(__name__)
 DB_FILE = '/home/clawdney/.openclaw/workspace/smart-plant-pot/data.db'
 
+# MQTT settings
+MQTT_BROKER = '192.168.178.158'
+MQTT_PORT = 1883
+MQTT_COMMAND_TOPIC = 'smart-plant-pot/command'
+
+import paho.mqtt.client as mqtt
+
+def send_mqtt_command(command):
+    """Send command to ESP8266 via MQTT"""
+    try:
+        client = mqtt.Client()
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        client.publish(MQTT_COMMAND_TOPIC, json.dumps(command))
+        client.disconnect()
+        return True
+    except Exception as e:
+        print(f"MQTT error: {e}")
+        return False
+
 # ============== DATABASE ==============
 def init_db():
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
@@ -27,13 +47,13 @@ def init_db():
         registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     
-    c.execute('''CREATE TABLE IF NOT EXISTS events (
+    c.execute('''CREATE TABLE IF NOT EXISTS readings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         device_id TEXT,
-        event_type TEXT,
         soil_moisture INTEGER,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(device_id) REFERENCES devices(id)
+        pump_on BOOLEAN,
+        wifi_rssi INTEGER,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS schedules (
@@ -57,6 +77,9 @@ def init_db():
     conn.commit()
     conn.close()
 
+import os
+init_db()
+
 # ============== ROUTES ==============
 @app.route('/')
 def index():
@@ -74,8 +97,6 @@ def register_device():
     
     c.execute('INSERT OR REPLACE INTO devices (id, name, type) VALUES (?, ?, ?)',
               (device_id, name, device_type))
-    
-    # Create default settings
     c.execute('INSERT OR IGNORE INTO settings (device_id) VALUES (?)', (device_id,))
     
     conn.commit()
@@ -91,10 +112,9 @@ def device_event(device_id):
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    
-    c.execute('INSERT INTO events (device_id, event_type, soil_moisture) VALUES (?, ?, ?)',
-              (device_id, event_type, soil_moisture))
-    
+    c.execute('''INSERT INTO readings (device_id, soil_moisture, pump_on, wifi_rssi)
+                 VALUES (?, ?, ?, ?)''',
+              (device_id, soil_moisture, event_type == 'pump_started', data.get('wifiRssi', 0)))
     conn.commit()
     conn.close()
     
@@ -106,7 +126,6 @@ def update_status(device_id):
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    
     c.execute('''INSERT OR REPLACE INTO settings 
                  (device_id, auto_watering, moisture_threshold, pump_duration, last_updated)
                  VALUES (?, ?, ?, ?, ?)''',
@@ -115,7 +134,6 @@ def update_status(device_id):
                data.get('moistureThreshold', 30),
                data.get('pumpDuration', 5),
                datetime.datetime.now()))
-    
     conn.commit()
     conn.close()
     
@@ -131,18 +149,18 @@ def list_devices():
     conn.close()
     return jsonify(devices)
 
-@app.route('/api/devices/<device_id>/events')
-def get_events(device_id):
-    limit = request.args.get('limit', 50)
+@app.route('/api/devices/<device_id>/readings')
+def get_readings(device_id):
+    limit = request.args.get('limit', 20)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''SELECT event_type, soil_moisture, timestamp 
-                 FROM events WHERE device_id = ? 
+    c.execute('''SELECT soil_moisture, pump_on, wifi_rssi, timestamp 
+                 FROM readings WHERE device_id = ? 
                  ORDER BY timestamp DESC LIMIT ?''', (device_id, limit))
-    events = [{'type': row[0], 'soil_moisture': row[1], 'timestamp': row[2]} 
-              for row in c.fetchall()]
+    readings = [{'soil_moisture': row[0], 'pump_on': bool(row[1]), 'wifi_rssi': row[2], 'timestamp': row[3]} 
+                for row in c.fetchall()]
     conn.close()
-    return jsonify(events)
+    return jsonify(readings)
 
 @app.route('/api/devices/<device_id>/settings')
 def get_settings(device_id):
@@ -164,9 +182,12 @@ def get_settings(device_id):
 
 @app.route('/api/devices/<device_id>/command', methods=['POST'])
 def send_command(device_id):
-    # This would publish to MQTT in production
-    # For now, just acknowledge
-    return jsonify({'status': 'ok', 'message': 'Command sent to device'})
+    data = request.json
+    success = send_mqtt_command(data)
+    
+    if success:
+        return jsonify({'status': 'ok', 'message': 'Command sent to device'})
+    return jsonify({'status': 'error', 'message': 'Failed to send command'}), 500
 
 @app.route('/api/schedule', methods=['GET', 'POST'])
 def manage_schedule():
@@ -176,7 +197,6 @@ def manage_schedule():
         data = request.json
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        
         c.execute('''INSERT OR REPLACE INTO schedules 
                      (device_id, enabled, hour, minute, duration)
                      VALUES (?, ?, ?, ?, ?)''',
@@ -185,13 +205,10 @@ def manage_schedule():
                    data.get('hour', 8),
                    data.get('minute', 0),
                    data.get('duration', 5)))
-        
         conn.commit()
         conn.close()
-        
         return jsonify({'status': 'ok'})
     
-    # GET
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''SELECT enabled, hour, minute, duration 
@@ -200,12 +217,7 @@ def manage_schedule():
     conn.close()
     
     if row:
-        return jsonify({
-            'enabled': bool(row[0]),
-            'hour': row[1],
-            'minute': row[2],
-            'duration': row[3]
-        })
+        return jsonify({'enabled': bool(row[0]), 'hour': row[1], 'minute': row[2], 'duration': row[3]})
     return jsonify({'enabled': False, 'hour': 8, 'minute': 0, 'duration': 5})
 
 # ============== HTML TEMPLATE ==============
@@ -335,7 +347,7 @@ HTML_TEMPLATE = '''
             </div>
             
             <div class="card">
-                <h2>📊 Recent Events</h2>
+                <h2>📊 Recent Readings</h2>
                 <div class="events" id="eventsList"></div>
             </div>
         </div>
@@ -346,15 +358,15 @@ HTML_TEMPLATE = '''
         
         async function fetchStatus() {
             try {
-                const response = await fetch(`/api/devices/${deviceId}/events?limit=10`);
-                const events = await response.json();
+                const response = await fetch(`/api/devices/${deviceId}/readings?limit=10`);
+                const readings = await response.json();
                 
-                if (events.length > 0) {
-                    const latest = events[0];
+                if (readings.length > 0) {
+                    const latest = readings[0];
                     updateMoisture(latest.soil_moisture || 50);
+                    updatePumpStatus(latest.pump_on);
+                    updateReadingsList(readings);
                 }
-                
-                updateEventsList(events);
             } catch (e) {
                 console.error('Error fetching status:', e);
             }
@@ -372,12 +384,24 @@ HTML_TEMPLATE = '''
             }
         }
         
-        function updateEventsList(events) {
+        function updatePumpStatus(on) {
+            const indicator = document.getElementById('pumpIndicator');
+            const status = document.getElementById('pumpStatus');
+            if (on) {
+                indicator.classList.add('status-on');
+                status.textContent = 'ON';
+            } else {
+                indicator.classList.remove('status-on');
+                status.textContent = 'OFF';
+            }
+        }
+        
+        function updateReadingsList(readings) {
             const list = document.getElementById('eventsList');
-            list.innerHTML = events.map(e => `
+            list.innerHTML = readings.map(r => `
                 <div class="event">
-                    <strong>${e.type}</strong> - ${e.soil_moisture}%
-                    <div class="event-time">${e.timestamp}</div>
+                    <strong>${r.soil_moisture}%</strong> moisture | Pump: ${r.pump_on ? 'ON' : 'OFF'}
+                    <div class="event-time">${r.timestamp} | RSSI: ${r.wifi_rssi}</div>
                 </div>
             `).join('');
         }
@@ -441,6 +465,5 @@ HTML_TEMPLATE = '''
 '''
 
 if __name__ == '__main__':
-    init_db()
     print("🌱 Smart Plant Pot Dashboard starting on http://0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=True)
